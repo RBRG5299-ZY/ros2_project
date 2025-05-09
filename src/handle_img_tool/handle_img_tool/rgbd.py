@@ -1,136 +1,120 @@
 import rclpy
-from sensor_msgs.msg import Image,PointCloud2
+from sensor_msgs.msg import Image, PointCloud2
 from nav_msgs.msg import Path
 from geometry_msgs.msg import Point, Quaternion, PoseStamped
 from std_msgs.msg import Int32MultiArray, Float32MultiArray
 from rclpy.node import Node
-from cv_bridge import CvBridge 
+from cv_bridge import CvBridge
 import numpy as np
 import time
-# if run this python script should remove .
-# it is correct to add . when run in ros2
 from .vis import Window_3d
-from .utils import rgbd2xyz_from_points_list,create_pointcloud
-from .odometry import Monocular_SLAM
+from .utils import rgbd2xyz_from_points_list, create_pointcloud
+from .odometry import Monocular_SLAM, Binocular_SLAM  # import both SLAM classes
+
 class RGBD_subscriber(Node):
-    def __init__(self,node_name):
+    def __init__(self, node_name):
         super().__init__(node_name)
         self.get_logger().info(f"start rgbd_sub:{node_name}")
-        # show colored_pc_window
-        # self.win = Window_3d()
 
-        self.mo_slam = Monocular_SLAM()
-            
-        # cvbridge is to change format between cv2.Mat and sensor_msgs.Image
+        # 使用双目SLAM以支持多种优化算法
+        self.bi_slam = Binocular_SLAM()
         self.bridge = CvBridge()
         self.clr = None
         self.depth = None
         self.dep_shape = None
         self.k = None
         self.dist_coeffs = None
-        
-        # create path
-        self.path = Path()
-        self.path.header.frame_id = 'map'
 
-        # create five subscributer to get msg
-        self.k_sub = self.create_subscription(Float32MultiArray,'K',self.callback_K,1)
-        self.dist_coeffs_sub = self.create_subscription(Float32MultiArray,'dist_coeffs',self.callback_dist_coeffs,1)
-        self.clr_sub = self.create_subscription(Image,'rgbd_color_topic',self.callback1,10)
-        # self.depth_sub = self.create_subscription(Image,'rgbd_depth_topic',self.sub_callback,10)
-        self.depth_ori_sub = self.create_subscription(Int32MultiArray,'rgbd_depth_ori_topic',self.callback2,10)
-        self.depth_shape_sub = self.create_subscription(Int32MultiArray,'rgbd_depth_shape_topic',self.callback3,10)
-        
-        # create points pubilsher
-        self.pointcloud1_pub = self.create_publisher(PointCloud2,'rgbd_to_xyz_points',10)
-        self.pointcloud2_pub = self.create_publisher(PointCloud2,'map',10)
-        
-        # create path publisher
-        self.path_pub = self.create_publisher(Path,'traj', 10)
+        # 三种优化方式的轨迹发布器
+        self.path_pub_no_opt = self.create_publisher(Path, 'traj_no_opt', 10)
+        self.path_pub_ga = self.create_publisher(Path, 'traj_ga', 10)
+        self.path_pub_pso = self.create_publisher(Path, 'traj_pso', 10)
 
-    def callback_K(self,k):
-        np_array = np.array(k.data, dtype=np.float32)
-        self.k = np.reshape(np_array,(3,3))
+        # 点云发布器
+        self.pointcloud_pub = self.create_publisher(PointCloud2, 'pointcloud', 10)
 
-    def callback_dist_coeffs(self,dist_coeffs):
-        np_array = np.array(dist_coeffs.data, dtype=np.float32)
-        self.dist_coeffs = np_array
+        # 参数订阅器
+        self.k_sub = self.create_subscription(Float32MultiArray, 'K', self.callback_K, 1)
+        self.dist_coeffs_sub = self.create_subscription(Float32MultiArray, 'dist_coeffs', self.callback_dist_coeffs, 1)
+        self.clr_sub = self.create_subscription(Image, 'rgbd_color_topic', self.callback_color, 10)
+        self.depth_ori_sub = self.create_subscription(Int32MultiArray, 'rgbd_depth_ori_topic', self.callback_depth, 10)
+        self.depth_shape_sub = self.create_subscription(Int32MultiArray, 'rgbd_depth_shape_topic', self.callback_shape, 10)
 
-    def callback1(self, clr):
-        cv_image = self.bridge.imgmsg_to_cv2(clr, desired_encoding="bgr8")
-        self.clr = cv_image
-        self.process_messages()
+    def callback_K(self, msg):
+        arr = np.array(msg.data, dtype=np.float32).reshape(3, 3)
+        self.k = arr
 
-    def callback2(self, depth):
-        np_array = np.array(depth.data, dtype=np.int32)
-        self.depth = np_array
-        self.process_messages()
-    
-    def callback3(self, shape):
-        np_array = np.array(shape.data, dtype=np.int32)
-        self.dep_shape = np_array
-        self.process_messages()
+    def callback_dist_coeffs(self, msg):
+        self.dist_coeffs = np.array(msg.data, dtype=np.float32)
 
-    def process_messages(self):
-        if self.clr is not None and self.depth is not None and self.dep_shape is not None and self.k is not None:            
-            depth_img = np.reshape(self.depth,self.dep_shape)
-            depth_img = depth_img.astype(np.uint16)
-            # print(depth_img.shape,depth_img.dtype)
-            if self.mo_slam.k is None or self.mo_slam.dist_coeffs is None:
-                self.mo_slam.set_k(self.k)
-                self.mo_slam.set_dist_coeffs(self.dist_coeffs)
+    def callback_color(self, msg):
+        self.clr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        self._try_process()
 
-            self.mo_slam.extract_points(self.clr)
-            position = self.mo_slam.pose[:,0]
-            print('current pose {}'.format(position))
-            fx,fy,cx,cy = self.k[0,0],self.k[1,1],self.k[0,2],self.k[1,2]
-            
-            # 恢复3d坐标
-            t = time.time()
-            points, colors = rgbd2xyz_from_points_list(self.mo_slam.map_points,self.clr, depth_img, float(fx), float(fy), float(cx), float(cy))
-            print('compute 3d:{:4f}s'.format(time.time() - t))
-            # print('ori pts',points)
-            points = np.array([self.mo_slam.pose[:,0]+p for p in points])
-            # print('new pts',points)
+    def callback_depth(self, msg):
+        self.depth = np.array(msg.data, dtype=np.int32)
+        self._try_process()
 
-            t = time.time()
-            pointscloud1 = create_pointcloud(points)
-            pointscloud2 = create_pointcloud(self.mo_slam.map_colors)
-            print('create pointscloud: {:4f} s'.format(time.time()-t))
+    def callback_shape(self, msg):
+        self.dep_shape = np.array(msg.data, dtype=np.int32)
+        self._try_process()
 
-            # 展示3d坐标
-            # t = time.time()
-            # self.win.update_win(np.array(points),np.array(colors),np.array(self.mo_slam.trajectory))
-            # print('show 3d: {:4f}s'.format(time.time() - t))
-            
-            # 展示轨迹
-            pose = PoseStamped()
+    def _try_process(self):
+        # 避免对 numpy 数组使用 "in" 判断，改为 any(... is None)
+        if any(v is None for v in (self.clr, self.depth, self.dep_shape, self.k)):
+            return
 
-            point = Point()
-            point.x, point.y, point.z = float(position[0]),float(position[1]),float(position[2])
-            pose.pose.position = point
-            
-            quat = Quaternion()
-            quat.x,quat.y,quat.z,quat.w = 0.0,0.0,0.0,1.0
-            pose.pose.orientation = quat
-            
-            self.path.poses.append(pose)
-            self.path.header.stamp = self.get_clock().now().to_msg()
-            
-            self.path_pub.publish(self.path)
-            
-            self.pointcloud1_pub.publish(pointscloud1)
-            self.pointcloud2_pub.publish(pointscloud2)  
-            self.clr = None
-            self.depth = None
-            self.dep_shape = None
+        # 重塑深度图
+        depth_img = self.depth.reshape(self.dep_shape).astype(np.uint16)
+
+        # —— 核心修改 —— #
+        # 不再把 depth_img 传给双目 SLAM，防止单通道图像在内部被误当 BGR 转灰度
+        self.bi_slam.update((self.clr, self.clr.copy()))
+        # —— 修改结束 —— #
+
+        # 发布三种优化方式的路径
+        for method, pub, path_list in zip(
+                ['none', 'ga', 'pso'],
+                [self.path_pub_no_opt, self.path_pub_ga, self.path_pub_pso],
+                [self.bi_slam.lpath_no_opt, self.bi_slam.lpath_ga, self.bi_slam.lpath_pso]):
+
+            # 计算当前优化方法的三维重建
+            self.bi_slam.compute_xyz_camera(method)
+
+            # 构建并发布 Path
+            path_msg = Path()
+            path_msg.header.frame_id = 'map'
+            for p in path_list:
+                pose = PoseStamped()
+                pose.pose.position = Point(x=p[0], y=p[1], z=p[2])
+                pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+                path_msg.poses.append(pose)
+            pub.publish(path_msg)
+
+        # 将像素点列表转换成全局点云并发布
+        # pts_uv = self.bi_slam.map_pts
+        # fx, fy = self.k[0,0], self.k[1,1]
+        # cx, cy = self.k[0,2], self.k[1,2]
+        # points, colors = rgbd2xyz_from_points_list(pts_uv, self.clr, depth_img, fx, fy, cx, cy)
+        # points_global = np.array([self.bi_slam.lpose[:3,3] + pt for pt in points])
+        # pc2_msg = create_pointcloud(points_global)
+        # self.pointcloud_pub.publish(pc2_msg)
+        # 直接将 SLAM 生成的三维地图点发布为点云
+        if len(self.bi_slam.map_pts) > 0:
+            points = np.array(self.bi_slam.map_pts)  # 已经是世界坐标下的 (N,3) 点
+            pc2_msg = create_pointcloud(points)
+            self.pointcloud_pub.publish(pc2_msg)
+
+        # 重置以便接收下一帧
+        self.clr = self.depth = self.dep_shape = None
+
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = RGBD_subscriber(node_name="RGBD_subsvributer")  
-    rclpy.spin(node) 
+    node = RGBD_subscriber('rgbd_subscriber')
+    rclpy.spin(node)
     rclpy.shutdown()
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()

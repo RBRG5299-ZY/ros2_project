@@ -42,6 +42,9 @@ class Binocular(Node):
         self.frame_match_pub = self.create_publisher(Image,'result',10)         # 匹配结果图像
         self.path_pub = self.create_publisher(Path,'lpath',10)                  # 路径
         self.map_pub = self.create_publisher(PointCloud2,'map',10)              # 点云地图
+        self.path_pub_no_opt = self.create_publisher(Path, 'lpath_no_opt', 10)
+        self.path_pub_ga = self.create_publisher(Path, 'lpath_ga', 10)
+        self.path_pub_pso = self.create_publisher(Path, 'lpath_pso', 10)
         
     def callback_lK(self,k):
         # 左相机内参回调，将消息转换为3x3矩阵
@@ -71,7 +74,17 @@ class Binocular(Node):
         # 当左右图像和内参都准备好时，进行SLAM处理
         if self.limg is not None and self.rimg is not None and self.lk is not None and self.rk is not None:            
             self.bino_slam.update((self.limg,self.rimg))  # 更新SLAM状态
-            self.bino_slam.compute_xyz_camera()           # 计算三维点
+
+            # 计算三维点并保存三种优化方式下的轨迹
+            self.bino_slam.compute_xyz_camera(method='none')
+            self.bino_slam.compute_xyz_camera(method='ga')
+            self.bino_slam.compute_xyz_camera(method='pso')
+
+            # 发布三种轨迹
+            self.publish_path(self.bino_slam.lpath_no_opt, self.path_pub_no_opt, 'no_opt')
+            self.publish_path(self.bino_slam.lpath_ga, self.path_pub_ga, 'ga')
+            self.publish_path(self.bino_slam.lpath_pso, self.path_pub_pso, 'pso')
+
             path1 = self.bino_slam.lpath                  # 左相机轨迹
             path2 = self.bino_slam.rpath                  # 右相机轨迹
             path1 = np.array(path1)
@@ -100,6 +113,18 @@ class Binocular(Node):
             self.frame_match_pub.publish(self.bridge.cv2_to_imgmsg(img,'bgr8'))  # 发布匹配图像
             self.limg = None
             self.rimg = None
+
+    def publish_path(self, path_list, publisher, label):
+        from nav_msgs.msg import Path
+        from geometry_msgs.msg import PoseStamped, Point, Quaternion
+        path_msg = Path()
+        path_msg.header.frame_id = 'map'
+        for pt in path_list:
+            pose = PoseStamped()
+            pose.pose.position = Point(x=float(pt[0]), y=float(pt[1]), z=float(pt[2]))
+            pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+            path_msg.poses.append(pose)
+        publisher.publish(path_msg)
 
 def main(args=None):
     # ROS2节点主入口
